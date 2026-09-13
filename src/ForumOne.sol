@@ -49,6 +49,15 @@ contract ForumOne is
     ///         long-lived attestation.
     uint64 public constant MAX_COSIGNATURE_VALIDITY = 1 hours;
 
+    /// @notice The floor on `maxOrderDuration`. At zero no signed order could satisfy the
+    ///         lifetime cap and every signed fill would stop with nothing looking paused; the
+    ///         pause is meant to be the one visible stop.
+    uint64 public constant MIN_ORDER_DURATION = 1 days;
+
+    /// @notice The floor on `cosignatureValidity`. At zero no attestation could be both unexpired
+    ///         and within the window, with the same silent effect as a zero order duration.
+    uint64 public constant MIN_COSIGNATURE_VALIDITY = 60 seconds;
+
     /// @dev The EIP-712 signing domain. Deployments on different chains share one CREATE2 address,
     ///      so `chainId`, not `verifyingContract`, is what stops cross-chain signature replay.
     ///      Bumping the version invalidates every outstanding signed order at once.
@@ -126,9 +135,11 @@ contract ForumOne is
 
     /// @notice Sets how far into the future a signed order's expiration may reach.
     /// @dev Capped at `MAX_ORDER_DURATION_LIMIT` so no admin call can make outstanding signed
-    ///      orders effectively permanent.
+    ///      orders effectively permanent, and floored at `MIN_ORDER_DURATION` so none can stop
+    ///      every signed fill without pausing.
     function setMaxOrderDuration(uint64 duration) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (duration > MAX_ORDER_DURATION_LIMIT) revert MaxOrderDurationTooLong(duration, MAX_ORDER_DURATION_LIMIT);
+        if (duration < MIN_ORDER_DURATION) revert MaxOrderDurationTooShort(duration, MIN_ORDER_DURATION);
 
         _getStorage().maxOrderDuration = duration;
 
@@ -136,11 +147,15 @@ contract ForumOne is
     }
 
     /// @notice Sets how long a platform attestation may remain fillable.
-    /// @dev Capped at `MAX_COSIGNATURE_VALIDITY`. The short window is what makes off-chain
-    ///      cancellation effective: an order becomes unfillable within one window of the platform
-    ///      declining to attest it.
+    /// @dev Capped at `MAX_COSIGNATURE_VALIDITY` and floored at `MIN_COSIGNATURE_VALIDITY`. The
+    ///      short window is what makes off-chain cancellation effective: an order becomes
+    ///      unfillable within one window of the platform declining to attest it. The floor keeps
+    ///      the window from being closed outright, which would stop every signed fill silently.
     function setCosignatureValidity(uint64 validity) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (validity > MAX_COSIGNATURE_VALIDITY) revert CosignatureValidityTooLong(validity, MAX_COSIGNATURE_VALIDITY);
+        if (validity < MIN_COSIGNATURE_VALIDITY) {
+            revert CosignatureValidityTooShort(validity, MIN_COSIGNATURE_VALIDITY);
+        }
 
         _getStorage().cosignatureValidity = validity;
 
@@ -199,18 +214,54 @@ contract ForumOne is
         emit CollectionPauseUpdated(collection, paused_);
     }
 
-    /// @notice Sets or clears the curator royalty override for a collection.
+    function setCurrencyApproval(address currency, bool approved) external onlyRole(CURATOR_ROLE) {
+        if (currency == address(0)) revert ZeroAddress();
+        MarketplaceStorage storage s = _getStorage();
+        s.approvedCurrencies[currency] = approved;
+        emit CurrencyApprovalUpdated(currency, approved);
+    }
+
+    /// @notice Pins which standard the marketplace treats a collection as speaking.
+    /// @dev The answer to a collection that misreports itself through ERC-165. Detection asks the
+    ///      collection `supportsInterface` for ERC-1155 and then ERC-721, and a contract that
+    ///      behaves as one of the two but answers false for both — or answers for the other one —
+    ///      cannot be traded or transferred here at all. This makes ERC-165 the default rather
+    ///      than the authority: an override wins outright and the collection is not asked.
+    ///
+    ///      Curator, the role that decides what may trade here, and settable for any collection,
+    ///      approved or not, so the pin can be in place before approval. `0` restores
+    ///      auto-detect. Nothing is validated against the collection — a pin is a statement about
+    ///      a contract the curator has read, and a wrong pin simply makes that collection's calls
+    ///      fail the way the pinned standard's calls fail; `previewTokenType` is what the panel
+    ///      checks it with beforehand.
+    /// @param collection The collection to pin.
+    /// @param tokenType `0` auto-detect, `1` ERC-721, `2` ERC-1155. Anything above reverts.
+    function setCollectionTokenType(address collection, uint8 tokenType) external onlyRole(CURATOR_ROLE) {
+        if (collection == address(0)) revert ZeroAddress();
+        if (tokenType > MarketplaceStorageLib.TOKEN_TYPE_ERC1155) revert InvalidTokenType(tokenType);
+
+        _getStorage().collectionTokenType[collection] = tokenType;
+        emit CollectionTokenTypeUpdated(collection, tokenType);
+    }
+
+    // ============ Collection Settings (creator) ============
+    //
+    // These two belong to the collection's creator, not to the marketplace: its `owner()` or a
+    // holder of its default admin role, the same rule a Limit Break transfer validator applies to
+    // its own settings. The marketplace's admin has no standing here, and a curator only stands in
+    // for a collection that has no resolvable owner (`ForumOneSettlement.isCollectionManager`).
+
+    /// @notice Sets or clears a collection's royalty override.
     /// @dev An override may take up to `10000 - platformFeeBps` bps — everything the platform fee
     ///      does not, leaving the seller netting zero. Anything above that reverts with
     ///      `RoyaltyOverrideTooHigh`. The ceiling is checked against the fee in force at set time;
     ///      if the platform fee is raised afterwards the sale still settles, because settlement
-    ///      clamps the royalty to `price - platformFeeAmount`.
-    function setRoyaltyOverride(address collection, address recipient, uint16 feeBps, bool isSet)
-        external
-        onlyRole(CURATOR_ROLE)
-    {
+    ///      clamps the royalty to `price - platformFeeAmount`. Overrides written before the v2
+    ///      upgrade stay as they are until the creator replaces or clears them.
+    function setRoyaltyOverride(address collection, address recipient, uint16 feeBps, bool isSet) external {
         if (collection == address(0)) revert ZeroAddress();
         if (isSet && recipient == address(0)) revert ZeroAddress();
+        _requireCollectionManager(collection);
 
         MarketplaceStorage storage s = _getStorage();
         if (uint256(feeBps) + s.platformFeeBps > BPS_DENOMINATOR) revert RoyaltyOverrideTooHigh(feeBps);
@@ -219,11 +270,23 @@ contract ForumOne is
         emit RoyaltyOverrideUpdated(collection, recipient, feeBps, isSet);
     }
 
-    function setCurrencyApproval(address currency, bool approved) external onlyRole(CURATOR_ROLE) {
-        if (currency == address(0)) revert ZeroAddress();
-        MarketplaceStorage storage s = _getStorage();
-        s.approvedCurrencies[currency] = approved;
-        emit CurrencyApprovalUpdated(currency, approved);
+    /// @notice Switches the marketplace's unpaid transfer path — `transferToken` and
+    ///         `batchTransferTokens` — off or on for a collection. Sales are never affected.
+    /// @dev Exists so a collection whose own policy forbids free transfers can have the
+    ///      marketplace honour that policy itself, rather than be that collection's one
+    ///      royalty-free way to move a token.
+    function setTransfersDisabled(address collection, bool disabled) external {
+        if (collection == address(0)) revert ZeroAddress();
+        _requireCollectionManager(collection);
+
+        _getStorage().transfersDisabled[collection] = disabled;
+        emit CollectionTransfersUpdated(collection, disabled);
+    }
+
+    function _requireCollectionManager(address collection) private view {
+        if (!ForumOneSettlement.isCollectionManager(collection, msg.sender, hasRole(CURATOR_ROLE, msg.sender))) {
+            revert NotCollectionManager(collection, msg.sender);
+        }
     }
 
     // ============ Transfer Functions ============
@@ -259,7 +322,23 @@ contract ForumOne is
         return ForumOneOrders.createListing(_getStorage(), params);
     }
 
-    function buyListing(uint256 listingId, uint256 quantity) external payable nonReentrant whenNotPaused {
+    /// @notice Fills a stored listing at terms the buyer chose.
+    /// @dev The listing is read live, so the buyer names the currency and the most they will pay
+    ///      and the fill reverts `ListingTermsChanged` if `updateListing` moved either underneath
+    ///      them; a lower price settles at the lower price. A native fill requires
+    ///      `msg.value >= total` as stored and the excess is refunded in the same transaction. The
+    ///      native total is summed from storage before the terms check runs, so the msg.value
+    ///      check cannot be relied on as a price bound — `maxTotalPrice` is.
+    /// @param listingId The stored listing.
+    /// @param quantity Units to take. An ERC-1155 listing may be filled in parts until exhausted.
+    /// @param currency The currency the buyer accepted, `address(0)` for native.
+    /// @param maxTotalPrice The most the buyer will pay for `quantity` units, in that currency.
+    function buyListing(uint256 listingId, uint256 quantity, address currency, uint256 maxTotalPrice)
+        external
+        payable
+        nonReentrant
+        whenNotPaused
+    {
         MarketplaceStorage storage s = _getStorage();
         Listing storage listing = s.listings[listingId];
         uint256 nativeRequired;
@@ -268,7 +347,7 @@ contract ForumOne is
             if (msg.value < nativeRequired) revert InsufficientPayment(nativeRequired, msg.value);
         }
 
-        _executeBuy(listingId, quantity);
+        _executeBuy(listingId, quantity, currency, maxTotalPrice);
 
         if (msg.value > nativeRequired) {
             uint256 refund = msg.value - nativeRequired;
@@ -277,21 +356,20 @@ contract ForumOne is
         }
     }
 
-    function batchBuyListings(uint256[] calldata listingIds, uint256[] calldata quantities)
-        external
-        payable
-        nonReentrant
-        whenNotPaused
-    {
-        if (listingIds.length != quantities.length) revert ArrayLengthMismatch();
-        if (listingIds.length > MAX_BATCH_SIZE) revert BatchTooLarge(listingIds.length, MAX_BATCH_SIZE);
+    /// @notice Fills several stored listings in one all-or-nothing call.
+    /// @dev Each leg carries the terms its buyer accepted and is checked as `buyListing` checks
+    ///      one; a single leg whose terms moved reverts the whole batch. The native total is
+    ///      summed from storage and the excess refunded once at the end.
+    /// @param legs The fills, at most `MAX_BATCH_SIZE`.
+    function batchBuyListings(BuyLeg[] calldata legs) external payable nonReentrant whenNotPaused {
+        if (legs.length > MAX_BATCH_SIZE) revert BatchTooLarge(legs.length, MAX_BATCH_SIZE);
 
         MarketplaceStorage storage s = _getStorage();
         uint256 totalNativeRequired;
-        for (uint256 i = 0; i < listingIds.length;) {
-            Listing storage listing = s.listings[listingIds[i]];
+        for (uint256 i = 0; i < legs.length;) {
+            Listing storage listing = s.listings[legs[i].listingId];
             if (listing.currency == address(0)) {
-                totalNativeRequired += listing.pricePerToken * quantities[i];
+                totalNativeRequired += listing.pricePerToken * legs[i].quantity;
             }
             unchecked {
                 ++i;
@@ -299,8 +377,8 @@ contract ForumOne is
         }
         if (msg.value < totalNativeRequired) revert InsufficientPayment(totalNativeRequired, msg.value);
 
-        for (uint256 i = 0; i < listingIds.length;) {
-            _executeBuy(listingIds[i], quantities[i]);
+        for (uint256 i = 0; i < legs.length;) {
+            _executeBuy(legs[i].listingId, legs[i].quantity, legs[i].currency, legs[i].maxTotalPrice);
             unchecked {
                 ++i;
             }
@@ -322,7 +400,12 @@ contract ForumOne is
         ForumOneOrders.cancelStaleListing(_getStorage(), listingId);
     }
 
-    function updateListing(uint256 listingId, ListingUpdate calldata params) external whenNotPaused {
+    /// @notice Changes a stored listing's currency, price and expiration at once, and re-fixes
+    ///         the royalty and platform fee it will settle under.
+    /// @dev `nonReentrant` so a seller contract paid mid-batch cannot re-enter here and move a
+    ///      later leg's terms underneath the same buyer; `cancelListing` stays unguarded, since
+    ///      cancelling can only make a later leg revert.
+    function updateListing(uint256 listingId, ListingUpdate calldata params) external nonReentrant whenNotPaused {
         ForumOneOrders.updateListing(_getStorage(), listingId, params);
     }
 
@@ -332,8 +415,12 @@ contract ForumOne is
         return ForumOneOrders.makeOffer(_getStorage(), params);
     }
 
-    function acceptOffer(uint256 offerId) external nonReentrant whenNotPaused {
-        ForumOneOrders.acceptOffer(_getStorage(), offerId);
+    /// @notice Accepts a stored offer, settling it whole.
+    /// @dev A stored offer resolves its royalty and fee live at acceptance, so the seller names
+    ///      the least they will net; a royalty raised since they quoted it makes the accept
+    ///      revert `SellerProceedsBelowMinimum` rather than pay them less.
+    function acceptOffer(uint256 offerId, uint256 minSellerProceeds) external nonReentrant whenNotPaused {
+        ForumOneOrders.acceptOffer(_getStorage(), offerId, minSellerProceeds);
     }
 
     function cancelOffer(uint256 offerId) external {
@@ -413,23 +500,31 @@ contract ForumOne is
         }
     }
 
-    /// @notice Accepts a bid the offeror signed rather than stored, whole or not at all.
-    /// @dev The caller is the seller: they hold the token and are paid in the order's ERC-20.
-    function acceptSignedOffer(
-        SignedOrders.SignedOffer calldata order,
-        bytes calldata signature,
-        SignedOrders.Cosignature calldata cosig
-    ) external nonReentrant whenNotPaused {
-        // Runs every signed-order check and writes the fill count before any external call.
-        // The library is delegatecalled, so it runs in this contract's storage with the
-        // original `msg.sender`.
-        (bytes32 orderHash, uint256 filledToDate) =
-            SignedOrderChecks.checkSignedOffer(_getStorage(), _domainSeparatorV4(), order, signature, cosig);
+    /// @notice Accepts a bid the offeror signed rather than stored, in whole or in part.
+    /// @dev The caller is the seller: they hold `accept.tokenId`, sell `accept.quantity` units of
+    ///      it, and are paid `pricePerToken * quantity` in the order's ERC-20, less the fee and
+    ///      the royalty resolved live — so `accept.minSellerProceeds` is their floor on the net.
+    ///      The offer stays open to other holders until its signed quantity is exhausted.
+    function acceptSignedOffer(SignedOrders.SignedOfferAccept calldata accept) external nonReentrant whenNotPaused {
+        _acceptSignedOffer(accept);
+    }
 
-        TokenType tokenType = _detectTokenType(order.assetContract);
-        if (tokenType == TokenType.ERC721 && order.quantity != 1) revert InvalidQuantity();
+    /// @notice Accepts several signed offers in one all-or-nothing call.
+    /// @dev The legs may come from different offerors; each carries its own attestation, and the
+    ///      caller is the seller of every one. One failing leg reverts the whole call.
+    function batchAcceptSignedOffers(SignedOrders.SignedOfferAccept[] calldata accepts)
+        external
+        nonReentrant
+        whenNotPaused
+    {
+        if (accepts.length > MAX_BATCH_SIZE) revert BatchTooLarge(accepts.length, MAX_BATCH_SIZE);
 
-        _settleSignedOffer(order, tokenType, orderHash, filledToDate);
+        for (uint256 i = 0; i < accepts.length;) {
+            _acceptSignedOffer(accepts[i]);
+            unchecked {
+                ++i;
+            }
+        }
     }
 
     /// @notice Marks signed orders cancelled for the caller, without the platform's cooperation.
@@ -482,7 +577,7 @@ contract ForumOne is
             _getStorage(), _domainSeparatorV4(), order, signature, quantity, cosig
         );
 
-        TokenType tokenType = _detectTokenType(order.assetContract);
+        TokenType tokenType = _detectTokenType(_getStorage(), order.assetContract);
         if (tokenType == TokenType.ERC721 && order.quantity != 1) revert InvalidQuantity();
 
         _settleSignedListing(order, quantity, tokenType, orderHash, filledToDate);
@@ -525,24 +620,46 @@ contract ForumOne is
         _emitSignedListingFilled(receipt);
     }
 
-    /// @dev The offer counterpart of `_settleSignedListing`. A signed offer settles whole, so the
-    ///      settled quantity is always the order's own.
+    /// @dev The offer counterpart of `_fulfillSignedListing`. Every check, including that the
+    ///      leg's token is one the offer covers, runs in the library and writes the fill count
+    ///      before any external call. ERC-721 fills one token per leg, and an offer on exactly
+    ///      one ERC-721 token can only ever want one of it.
+    function _acceptSignedOffer(SignedOrders.SignedOfferAccept calldata accept) private {
+        (bytes32 orderHash, uint256 filledToDate) =
+            SignedOrderChecks.checkSignedOffer(_getStorage(), _domainSeparatorV4(), accept);
+
+        SignedOrders.SignedOffer calldata order = accept.order;
+        TokenType tokenType = _detectTokenType(_getStorage(), order.assetContract);
+        if (tokenType == TokenType.ERC721) {
+            if (accept.quantity != 1) revert InvalidQuantity();
+            if (order.criteriaRoot == bytes32(0) && order.quantity != 1) revert InvalidQuantity();
+        }
+
+        _settleSignedOffer(accept, tokenType, orderHash, filledToDate);
+    }
+
+    /// @dev The offer counterpart of `_settleSignedListing`: the leg's token and quantity, priced
+    ///      per unit.
     function _settleSignedOffer(
-        SignedOrders.SignedOffer calldata order,
+        SignedOrders.SignedOfferAccept calldata accept,
         TokenType tokenType,
         bytes32 orderHash,
         uint256 filledToDate
     ) private {
+        SignedOrders.SignedOffer calldata order = accept.order;
+        uint256 totalPrice = order.pricePerToken * accept.quantity;
+
         Settlement memory settlement;
         settlement.seller = msg.sender;
         settlement.buyer = order.signer;
         settlement.assetContract = order.assetContract;
-        settlement.tokenId = order.tokenId;
-        settlement.quantity = order.quantity;
+        settlement.tokenId = accept.tokenId;
+        settlement.quantity = accept.quantity;
         settlement.tokenType = tokenType;
         settlement.currency = order.currency;
-        settlement.totalPrice = order.totalPrice;
+        settlement.totalPrice = totalPrice;
         settlement.platformFeeBps = SafeCast.toUint16(order.platformFeeBps);
+        settlement.minSellerProceeds = accept.minSellerProceeds;
 
         SignedFillReceipt memory receipt;
         (receipt.royaltyRecipient, receipt.platformFeeAmount, receipt.royaltyAmount) = _settle(settlement);
@@ -550,10 +667,10 @@ contract ForumOne is
         receipt.seller = msg.sender;
         receipt.buyer = order.signer;
         receipt.assetContract = order.assetContract;
-        receipt.tokenId = order.tokenId;
-        receipt.quantity = order.quantity;
+        receipt.tokenId = accept.tokenId;
+        receipt.quantity = accept.quantity;
         receipt.filledToDate = filledToDate;
-        receipt.totalPrice = order.totalPrice;
+        receipt.totalPrice = totalPrice;
         receipt.currency = order.currency;
 
         _emitSignedOfferAccepted(receipt);
@@ -619,6 +736,36 @@ contract ForumOne is
 
     function getRoyaltyOverride(address collection) external view returns (RoyaltyOverride memory) {
         return _getStorage().royaltyOverrides[collection];
+    }
+
+    function areTransfersDisabled(address collection) external view returns (bool) {
+        return _getStorage().transfersDisabled[collection];
+    }
+
+    /// @notice The raw override stored for a collection: `0` auto-detect, `1` ERC-721,
+    ///         `2` ERC-1155.
+    /// @dev Says whether a resolved standard came from a curator's pin or from the collection's
+    ///      own ERC-165 answers; `previewTokenType` says what the standard is.
+    function getCollectionTokenType(address collection) external view returns (uint8) {
+        return _getStorage().collectionTokenType[collection];
+    }
+
+    /// @notice What the marketplace will conclude this collection's standard is: `1` ERC-721,
+    ///         `2` ERC-1155, or `0` when nothing resolves.
+    /// @dev The same resolution every trading path runs — the override first, then the ERC-165
+    ///      probes — reported instead of reverted, so the curator panel can ask the marketplace
+    ///      itself rather than replicate the probes client-side and drift from it. A `0` is
+    ///      exactly the case where every path that moves a token reverts
+    ///      `TokenTypeNotSupported`, and a curator's `setCollectionTokenType` is what fixes it.
+    ///
+    ///      Never reverts, for any address: an EOA, an address with no code, and a contract with
+    ///      no `supportsInterface` at all all answer `0`.
+    function previewTokenType(address collection) external view returns (uint8) {
+        return ForumOneSettlement.previewTokenType(_getStorage(), collection);
+    }
+
+    function isCollectionManager(address collection, address account) external view returns (bool) {
+        return ForumOneSettlement.isCollectionManager(collection, account, hasRole(CURATOR_ROLE, account));
     }
 
     function isCurrencyApproved(address currency) external view returns (bool) {
@@ -702,8 +849,8 @@ contract ForumOne is
 
     // ============ Internal: Buy Execution ============
 
-    function _executeBuy(uint256 listingId, uint256 quantity) internal {
-        ForumOneOrders.executeBuy(_getStorage(), listingId, quantity);
+    function _executeBuy(uint256 listingId, uint256 quantity, address currency, uint256 maxTotalPrice) internal {
+        ForumOneOrders.executeBuy(_getStorage(), listingId, quantity, currency, maxTotalPrice);
     }
 
     // ============ Internal: Settlement ============
@@ -741,7 +888,7 @@ contract ForumOne is
 
     // ============ Internal: Token Detection ============
 
-    function _detectTokenType(address assetContract) internal view returns (TokenType) {
-        return ForumOneSettlement.detectTokenType(assetContract);
+    function _detectTokenType(MarketplaceStorage storage s, address assetContract) internal view returns (TokenType) {
+        return ForumOneSettlement.detectTokenType(s, assetContract);
     }
 }

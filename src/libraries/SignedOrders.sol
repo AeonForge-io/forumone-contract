@@ -27,16 +27,25 @@ library SignedOrders {
         uint256 salt;
     }
 
-    /// @notice A bid the offeror signed instead of writing to storage.
+    /// @notice A bid the offeror signed instead of writing to storage: "X per unit, up to N" on
+    ///         one token id, on any id in a set, or on a whole collection.
     /// @dev `currency` must be a nonzero allowlisted ERC-20: a signature cannot pull native
-    ///      currency, so there is no native signed offer. Offers settle whole or not at all.
+    ///      currency, so there is no native signed offer. The offer fills in parts, by many
+    ///      holders, until `quantity` units have settled against its hash.
+    ///
+    ///      `criteriaRoot` is zero for an offer on exactly `tokenId`. Otherwise it is the Merkle
+    ///      root of the eligible token ids of `assetContract` — leaf `keccak256(abi.encode(id))`,
+    ///      OpenZeppelin sorted-pair hashing — and `tokenId` is ignored; the accepting leg names
+    ///      the id it sells and proves it against the root. One collection per offer, one price
+    ///      per unit per offer: a different price or a second collection is a second order.
     struct SignedOffer {
         address signer;
         address assetContract;
         uint256 tokenId;
+        bytes32 criteriaRoot;
         uint256 quantity;
         address currency;
-        uint256 totalPrice;
+        uint256 pricePerToken;
         uint256 expiration;
         uint256 platformFeeBps;
         uint256 counter;
@@ -61,12 +70,32 @@ library SignedOrders {
         Cosignature cosig;
     }
 
+    /// @notice One acceptance of a signed offer — the single `acceptSignedOffer` call and every
+    ///         leg of `batchAcceptSignedOffers` take this shape.
+    /// @dev `tokenId` is the token the caller sells: it must equal `order.tokenId` when the order
+    ///      has no criteria root, and must prove against the root through `proof` when it has
+    ///      one (`proof` is ignored otherwise). `quantity` is the units sold by this leg —
+    ///      exactly 1 for ERC-721 — and counts against the order's `quantity`.
+    ///      `minSellerProceeds` is the least the caller will net from this leg after the platform
+    ///      fee and the royalty, in the order's currency; settlement reverts
+    ///      `SellerProceedsBelowMinimum` below it, so a royalty raised between the seller's quote
+    ///      and the accept landing cannot quietly shrink their payout. Zero disables the check.
+    struct SignedOfferAccept {
+        SignedOffer order;
+        bytes signature;
+        uint256 tokenId;
+        uint256 quantity;
+        uint256 minSellerProceeds;
+        bytes32[] proof;
+        Cosignature cosig;
+    }
+
     bytes32 internal constant SIGNED_LISTING_TYPEHASH = keccak256(
         "SignedListing(address signer,address assetContract,uint256 tokenId,uint256 quantity,address currency,uint256 pricePerToken,uint256 expiration,uint256 platformFeeBps,uint256 counter,uint256 salt)"
     );
 
     bytes32 internal constant SIGNED_OFFER_TYPEHASH = keccak256(
-        "SignedOffer(address signer,address assetContract,uint256 tokenId,uint256 quantity,address currency,uint256 totalPrice,uint256 expiration,uint256 platformFeeBps,uint256 counter,uint256 salt)"
+        "SignedOffer(address signer,address assetContract,uint256 tokenId,bytes32 criteriaRoot,uint256 quantity,address currency,uint256 pricePerToken,uint256 expiration,uint256 platformFeeBps,uint256 counter,uint256 salt)"
     );
 
     bytes32 internal constant FULFILLMENT_AUTHORIZATION_TYPEHASH =
@@ -83,7 +112,15 @@ library SignedOrders {
         "SignedListing(address signer,address assetContract,uint256 tokenId,uint256 quantity,address currency,uint256 pricePerToken,uint256 expiration,uint256 platformFeeBps,uint256 counter,uint256 salt)";
 
     string internal constant SIGNED_OFFER_TYPE =
-        "SignedOffer(address signer,address assetContract,uint256 tokenId,uint256 quantity,address currency,uint256 totalPrice,uint256 expiration,uint256 platformFeeBps,uint256 counter,uint256 salt)";
+        "SignedOffer(address signer,address assetContract,uint256 tokenId,bytes32 criteriaRoot,uint256 quantity,address currency,uint256 pricePerToken,uint256 expiration,uint256 platformFeeBps,uint256 counter,uint256 salt)";
+
+    /// @notice The Merkle leaf a criteria offer's root is built over, for one eligible token id.
+    /// @dev A 32-byte preimage where every inner node hashes 64 bytes, so a leaf can never be
+    ///      passed off as a node or the reverse. The site builds the tree with the same leaf and
+    ///      OpenZeppelin's sorted-pair node hashing.
+    function criteriaLeaf(uint256 tokenId) internal pure returns (bytes32) {
+        return keccak256(abi.encode(tokenId));
+    }
 
     /// @notice The deepest bulk tree the contract will verify: 2**24 orders in one signature.
     /// @dev Seaport's ceiling, adopted for the same reason — the height fixes the type string the
@@ -140,9 +177,10 @@ library SignedOrders {
                 order.signer,
                 order.assetContract,
                 order.tokenId,
+                order.criteriaRoot,
                 order.quantity,
                 order.currency,
-                order.totalPrice,
+                order.pricePerToken,
                 order.expiration,
                 order.platformFeeBps,
                 order.counter,

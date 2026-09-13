@@ -4,6 +4,7 @@ pragma solidity 0.8.28;
 import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 import {IForumOne} from "../interfaces/IForumOne.sol";
@@ -94,22 +95,26 @@ library SignedOrderChecks {
         }
     }
 
-    /// @notice Runs every check a signed offer must pass, and records the fill.
-    /// @dev A signed offer settles whole, so it takes its entire quantity in one go; a second
-    ///      acceptance finds nothing remaining.
+    /// @notice Runs every check one acceptance of a signed offer must pass, and records the fill.
+    /// @dev The offer fills in parts: this leg takes `accept.quantity` units of `accept.tokenId`,
+    ///      counted against the order's `quantity` under its hash, and the count is written here
+    ///      before the marketplace makes any external call. The token the seller offers is the
+    ///      last check: it must be the order's own `tokenId`, or prove against the order's
+    ///      criteria root — and a criteria offer must have been signed with `tokenId` zero.
+    /// @return orderHash The order's EIP-712 struct hash.
+    /// @return filledToDate The cumulative quantity filled against this order after this leg.
     function checkSignedOffer(
         MarketplaceStorage storage s,
         bytes32 domainSeparator,
-        SignedOrders.SignedOffer calldata order,
-        bytes calldata signature,
-        SignedOrders.Cosignature calldata cosig
+        SignedOrders.SignedOfferAccept calldata accept
     ) external returns (bytes32 orderHash, uint256 filledToDate) {
+        SignedOrders.SignedOffer calldata order = accept.order;
         orderHash = order.hash();
 
-        _verifyOrderSignature(order.signer, domainSeparator, orderHash, signature, true);
-        _verifyCosignature(s, domainSeparator, orderHash, cosig);
+        _verifyOrderSignature(order.signer, domainSeparator, orderHash, accept.signature, true);
+        _verifyCosignature(s, domainSeparator, orderHash, accept.cosig);
 
-        filledToDate = _consumeOrder(s, order.signer, orderHash, order.counter, order.quantity, order.quantity);
+        filledToDate = _consumeOrder(s, order.signer, orderHash, order.counter, order.quantity, accept.quantity);
 
         _validateOrderLifetime(s, orderHash, order.expiration);
 
@@ -124,12 +129,35 @@ library SignedOrderChecks {
             revert IForumOne.CollectionPaused(order.assetContract);
         }
         if (msg.sender == order.signer) revert IForumOne.CannotFillOwnOrder(orderHash);
-        if (order.quantity == 0) revert IForumOne.InvalidQuantity();
-        if (order.totalPrice == 0) revert IForumOne.ZeroPriceNotAllowed();
+        if (accept.quantity == 0) revert IForumOne.InvalidQuantity();
+        if (order.pricePerToken == 0) revert IForumOne.ZeroPriceNotAllowed();
         if (order.currency == address(0)) revert IForumOne.OfferCurrencyMustBeERC20();
         if (!s.approvedCurrencies[order.currency]) {
             revert IForumOne.CurrencyNotApproved(order.currency);
         }
+
+        // A criteria offer names no token: its `tokenId` is ignored on this path, so a nonzero
+        // value is a malformed order, not a preference. Refused before eligibility so it is never
+        // a question of which id the proof happened to cover.
+        if (order.criteriaRoot != bytes32(0) && order.tokenId != 0) {
+            revert IForumOne.CriteriaOfferNamesToken(orderHash);
+        }
+
+        if (!_isEligibleToken(order, accept.tokenId, accept.proof)) {
+            revert IForumOne.OfferTokenNotEligible(orderHash, accept.tokenId);
+        }
+    }
+
+    /// @dev An offer with no criteria root covers exactly its own `tokenId`. One with a root
+    ///      covers every id whose leaf (`SignedOrders.criteriaLeaf`) proves against it; the
+    ///      order's `tokenId` field is not consulted. `proof` is only read on the criteria path.
+    function _isEligibleToken(SignedOrders.SignedOffer calldata order, uint256 tokenId, bytes32[] calldata proof)
+        private
+        pure
+        returns (bool)
+    {
+        if (order.criteriaRoot == bytes32(0)) return tokenId == order.tokenId;
+        return MerkleProof.verifyCalldata(proof, order.criteriaRoot, SignedOrders.criteriaLeaf(tokenId));
     }
 
     // ============ Internal ============

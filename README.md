@@ -18,10 +18,10 @@ Deployed at the same addresses on all three chains:
 | Contract | Address |
 | --- | --- |
 | `ForumOneProxy` | `0x167AfC814c5614C33b7140f6095a784b1F562582` |
-| `ForumOne` (implementation) | `0x4Cb7380B91C28A46DFfb626Bc5c0D5FAFC6C9391` |
-| `ForumOneSettlement` | `0x96797eC12f3503c628E3034f44D6968864893844` |
-| `ForumOneOrders` | `0x9bf7559C08d2ec17f888A1b2E3a09396c675bf2e` |
-| `SignedOrderChecks` | `0x9d3e2d329393c155951611bD2Dfa619c8E51837d` |
+| `ForumOne` (implementation) | `0x9c71EB1C355D8B57462a30bCF3c2D64Ac4736F29` |
+| `ForumOneSettlement` | `0xe428d8579B35A664d5AFa9Af0A8B79628F545e5a` |
+| `ForumOneOrders` | `0x9B4779fb6D8531430f7a77e308497e9A69a3bc3d` |
+| `SignedOrderChecks` | `0x14dc3Be49A120Fde8d24a9a82f925C5Ba2fB842B` |
 
 Source is verified on Etherscan, Basescan and Polygonscan.
 
